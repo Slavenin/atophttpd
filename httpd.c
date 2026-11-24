@@ -13,6 +13,7 @@
 #include <getopt.h>
 #include <linux/tcp.h>
 #include <linux/types.h>
+#include <limits.h>
 #include <netdb.h>
 #include <signal.h>
 #include <stdint.h>
@@ -31,6 +32,8 @@
 
 #include "httpd.h"
 #include "output.h"
+#include "sample.h"
+#include "timeutil.h"
 
 #include "version.h"
 
@@ -73,6 +76,8 @@ int hidecmdline = 0;
 /* HTTP codes */
 static char *http_200 = "HTTP/1.1 200 OK\r\n";
 static char *http_404 = "HTTP/1.1 404 Not Found\r\n";
+static char *http_503 = "HTTP/1.1 503 Service Unavailable\r\n";
+static unsigned int metrics_stale_after;
 
 /* HTTP content types */
 static char *http_content_type_none = "";
@@ -82,12 +87,30 @@ static char *http_content_type_deflate = "Content-Encoding: deflate\r\n";
 static char *http_generic = "Server: atop\r\n"
 "%s"	/* for http_content_type_XXX */
 "Content-Type: %s; charset=utf-8\r\n"
-"Content-Length: %d\r\n\r\n";
+"Content-Length: %zu\r\nConnection: close\r\n\r\n";
 
 /* HTTP content types */
 static char *http_content_type_html = "text/html";
 static char *http_content_type_css = "text/css";
 static char *http_content_type_javascript = "application/javascript";
+static char *http_content_type_text = "text/plain";
+static char *http_content_type_prometheus = "text/plain; version=0.0.4";
+static char *http_content_type_json = "application/json";
+
+static int http_write_all(connection *conn, const void *data, size_t len)
+{
+	const char *p = data;
+	while (len) {
+		int written = conn_write(conn, p, len);
+		if (written < 0 && written == -EINTR)
+			continue;
+		if (written <= 0)
+			return -EIO;
+		p += written;
+		len -= written;
+	}
+	return 0;
+}
 
 static int http_prepare_response(connection *conn)
 {
@@ -116,58 +139,53 @@ static int http_prepare_response(connection *conn)
 	return 0;
 }
 
-static void http_response_200(connection *conn, char *buf, size_t len, char *encoding, char* content_type)
+static void http_response(connection *conn, const char *status, const char *buf,
+		size_t len, char *encoding, char* content_type)
 {
-	struct iovec iovs[3], *iov;
 	int ret;
-	char content[128] = {0};
-	int content_length = 0;
+	char content[256] = {0};
 
 	ret = http_prepare_response(conn);
 	if (ret) {
 		goto closeconn;
 	}
 
-	/* 1, http code */
-	iov = &iovs[0];
-	iov->iov_base = http_200;
-	iov->iov_len = strlen(http_200);
-
-	/* 2, http generic content */
-	iov = &iovs[1];
-
-	content_length = sprintf(content, http_generic, encoding, content_type, len);
-	iov->iov_base = content;
-	iov->iov_len = content_length;
-
-	/* 3, sample data record */
-	iov = &iovs[2];
-	iov->iov_base = buf;
-	iov->iov_len = len;
-
-	conn_writev(conn, iovs, sizeof(iovs) / sizeof(iovs[0]));
+	ret = snprintf(content, sizeof(content), http_generic, encoding, content_type, len);
+	if (ret < 0 || (size_t)ret >= sizeof(content))
+		goto closeconn;
+	if (http_write_all(conn, status, strlen(status)) ||
+	    http_write_all(conn, content, ret) ||
+	    (len && http_write_all(conn, buf, len)))
+		log_debug("response write failed\n");
 
 closeconn:
 	conn_close(conn);
 }
 
+static void http_response_200(connection *conn, char *buf, size_t len, char *encoding, char* content_type)
+{
+	http_response(conn, http_200, buf, len, encoding, content_type);
+}
+
 static void http_show_samp_done(struct output *op, connection *conn)
 {
 	if (op->encoding == http_content_type_none) {
-		http_response_200(conn, op->ob.buf, op->ob.offset, op->encoding, http_content_type_html);
+		http_response_200(conn, op->ob.buf, op->ob.offset, op->encoding, http_content_type_json);
 		return;
 	}
 
 	/* compress data for encoding deflate */
-	char *compbuf = malloc(op->ob.offset);
-	unsigned long complen = op->ob.offset;
+	unsigned long complen = compressBound(op->ob.offset);
+	char *compbuf = malloc(complen);
 
-	if (compress((Bytef *)compbuf, &complen, (Bytef *)op->ob.buf, op->ob.offset) != Z_OK){
-		http_prepare_response(conn);
-		conn_write(conn, http_404, strlen(http_404));
+	if (!compbuf || compress((Bytef *)compbuf, &complen, (Bytef *)op->ob.buf, op->ob.offset) != Z_OK){
+		free(compbuf);
+		http_response(conn, http_503, "compression failed\n", 19,
+			http_content_type_none, http_content_type_text);
+		return;
 	}
 
-	http_response_200(conn, compbuf, complen, http_content_type_deflate, http_content_type_html);
+	http_response_200(conn, compbuf, complen, http_content_type_deflate, http_content_type_json);
 	free(compbuf);
 }
 
@@ -200,7 +218,7 @@ static int http_arg_str(char *req, char *needle, char *p, int len)
         if (!e)
                 e = s + strlen(s);
 
-	if (e - s > len)
+	if (e - s >= len)
 		return -1;
 
         memcpy(p, s, e - s);
@@ -226,7 +244,8 @@ static void http_showsamp(char *req, connection *conn)
 		return;
 	}
 
-	if (http_arg_str(req, "lables", lables, sizeof(lables)) < 0) {
+	if (http_arg_str(req, "lables", lables, sizeof(lables)) < 0 &&
+	    http_arg_str(req, "labels", lables, sizeof(lables)) < 0) {
 		char *err = "missing lables\r\n";
 		http_response_200(conn, err, strlen(err), http_content_type_none, http_content_type_html);
 		return;
@@ -250,6 +269,50 @@ static void http_showsamp(char *req, connection *conn)
 		http_response_200(conn, err, strlen(err), http_content_type_none, http_content_type_html);
 		return;
 	}
+}
+
+static void http_metrics(connection *conn)
+{
+	const struct raw_sample *sample = NULL;
+	uint64_t generation = 0;
+	char *body;
+	size_t length;
+	int ret = rawlog_get_recent_sample(&sample, &generation);
+	if (ret && ret != -ENOENT) {
+		http_response(conn, http_503, "rawlog read failed\n", 19,
+			http_content_type_none, http_content_type_text);
+		return;
+	}
+	ret = metrics_render(sample, generation, metrics_stale_after, &body, &length);
+	if (ret) {
+		http_response(conn, http_503, "metrics failed\n", 15,
+			http_content_type_none, http_content_type_text);
+		return;
+	}
+	http_response_200(conn, body, length, http_content_type_none,
+		http_content_type_prometheus);
+	free(body);
+}
+
+static void http_health(connection *conn)
+{
+	const struct raw_sample *sample = NULL;
+	uint64_t generation;
+	struct metrics_status status;
+	int ret = rawlog_get_recent_sample(&sample, &generation);
+	if (ret) {
+		http_response(conn, http_503, "rawlog unavailable\n", 19,
+			http_content_type_none, http_content_type_text);
+		return;
+	}
+	metrics_sample_status(sample, metrics_stale_after, time(NULL), &status);
+	if (!status.fresh || !status.available) {
+		http_response(conn, http_503, "sample unavailable\n", 19,
+			http_content_type_none, http_content_type_text);
+		return;
+	}
+	http_response_200(conn, "ok\n", 3, http_content_type_none,
+		http_content_type_text);
 }
 
 /* Import a binary file */
@@ -378,7 +441,7 @@ static void http_process_request(char *req, connection *conn)
 	char location[URL_LEN] = {0};
 	char *c;
 
-	if (strlen(req) > URL_LEN) {
+	if (strlen(req) >= URL_LEN) {
 		http_prepare_response(conn);
 		conn_write(conn, http_404, strlen(http_404));
 		return;
@@ -397,6 +460,10 @@ static void http_process_request(char *req, connection *conn)
 
 	if (!strcmp(location, "ping"))
 		http_ping(conn);
+	else if (!strcmp(location, "metrics"))
+		http_metrics(conn);
+	else if (!strcmp(location, "health"))
+		http_health(conn);
 	else if (!strcmp(location, "help"))
 		http_help(conn);
 	else if (!strcmp(location, "favicon.ico"))
@@ -461,7 +528,7 @@ static void httpd_handle_request(connection *conn) {
 			continue;
 		}
 
-		ret = conn_read(conn, inbuf + inbytes, sizeof(inbuf) - inbytes);
+		ret = conn_read(conn, inbuf + inbytes, sizeof(inbuf) - inbytes - 1);
 		if (ret < 0)
 		{
 			if (ret != -EAGAIN) {
@@ -470,12 +537,14 @@ static void httpd_handle_request(connection *conn) {
 			continue;
 		}
 
+		if (ret == 0)
+			goto close_fd;
 		inbytes += ret;
 		if ((inbytes >= 4) && strstr(inbuf, "\r\n\r\n"))
 			break;
 
 		/* buf is full, but we can not search the end of HTTP header */
-		if (inbytes == sizeof(inbuf))
+		if (inbytes >= sizeof(inbuf) - 1)
 			goto close_fd;
 	}
 
@@ -502,10 +571,12 @@ close_fd:
 
 static void httpd_update_cache(char *log_path)
 {
-	static time_t update;
-	time_t now = time(NULL);
+	static struct timespec update;
+	struct timespec now;
+	if (clock_gettime(CLOCK_MONOTONIC, &now) < 0)
+		return;
 
-	if (now - update < 3)
+	if (!cache_refresh_due(now, update, 3))
 		return;
 
 	if (rawlog_parse_all(log_path)) {
@@ -581,8 +652,8 @@ static void *httpd_routine(connection **listeners, char *log_path)
 			continue;
 		}
 
-		httpd_handle_request(conn);
 		httpd_update_cache(log_path);
+		httpd_handle_request(conn);
 		free(conn);
 	}
 
@@ -621,15 +692,17 @@ static int httpd(struct atophttd_context ctx)
 		ctx.listeners[conn_index] = listener;
 	}
 
-        if (ctx.daemonmode)
-                daemon(0, 0);
+	if (ctx.daemonmode && daemon(0, 0) < 0) {
+		perror("daemon");
+		return -errno;
+	}
 
 	httpd_routine(ctx.listeners, ctx.log_path);
 	return 0;
 }
 
 int __debug = 0;
-static char *short_opts = "dDhHp:a:P:t::A:C:c:k:V";
+static char *short_opts = "dDhHp:a:P:t:A:C:c:k:S:V";
 
 static struct option long_opts[] = {
 	{ "daemon",		no_argument,		0,	'd' },
@@ -637,7 +710,8 @@ static struct option long_opts[] = {
 	{ "port",		required_argument,	0,	'p' },
 	{ "addr",		required_argument,	0,	'a' },
 	{ "path",		required_argument,	0,	'P' },
-	{ "tls-port",		optional_argument,	0,	't'},
+	{ "tls-port",		required_argument,	0,	't'},
+	{ "metrics-stale-after", required_argument, 0, 'S'},
 	{ "tls-addr",		required_argument,	0,	'A'},
 	{ "ca-cert-file",	required_argument,	0,	'C' },
 	{ "cert-file",		required_argument,	0,	'c' },
@@ -662,6 +736,7 @@ static void httpd_showhelp(void)
 	printf("  -c/--cert-file PATH \n    Path to the server TLS cert file, default %s\n", DEFAULT_CERT_FILE);
 	printf("  -k/--key-file PATH  \n    Path to the server TLS key file, default %s\n", DEFAULT_KEY_FILE);
 	printf("  -H/--hide-cmdline   \n    hide cmdline for security protection\n");
+	printf("  -S/--metrics-stale-after SECONDS\n    metrics freshness limit, default max(30, 2 * interval)\n");
 	printf("  -h/--help           \n    show help\n\n");
 	printf("  maintained by       \n    zhenwei pi<pizhenwei@bytedance.com> (HTTP backend)\n");
 	printf("                            enhua zhou<zhouenhua@bytedance.com> (HTTP frontend)\n");
@@ -722,6 +797,18 @@ int main(int argc, char *argv[])
 				break;
 			case 'H':
 				hidecmdline = 1;
+				break;
+			case 'S':
+				{
+					char *end;
+					errno = 0;
+					unsigned long value = strtoul(optarg, &end, 10);
+					if (errno || end == optarg || optarg[0] == '-' || *end || value > UINT_MAX) {
+						fprintf(stderr, "invalid metrics freshness limit: %s\n", optarg);
+						return 2;
+					}
+					metrics_stale_after = value;
+				}
 				break;
 			case 'V':
 				httpd_showversion();

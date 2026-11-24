@@ -12,13 +12,16 @@
 
 #include "httpd.h"
 
+#include <errno.h>
 #include <limits.h>
 #include <netinet/in.h>
-#include <openssl/err.h>
-#include <openssl/ssl.h>
+#include <sys/socket.h>
+#include <sys/time.h>
 #include <stdlib.h>
 
 #ifdef USE_TLS
+#include <openssl/err.h>
+#include <openssl/ssl.h>
 typedef struct tls_connection {
 	connection c;
 	SSL* ssl;
@@ -143,11 +146,14 @@ static int conn_tls_accept(connection * listener, connection* conn) {
 		perror("tls clifd is illegal!");
 		return -EINVAL;
 	}
+	struct timeval timeout = {.tv_sec = 5};
+	setsockopt(tls_conn->c.fd, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
+	setsockopt(tls_conn->c.fd, SOL_SOCKET, SO_SNDTIMEO, &timeout, sizeof(timeout));
 
 	SSL_set_fd(tls_conn->ssl, tls_conn->c.fd);
 	if (SSL_accept(tls_conn->ssl) <= 0) {
 		printf("SSL_TLS handshake failed: %s\n", ERR_error_string(ERR_get_error(), NULL));
-		return -errno;
+		return -EPROTO;
 	}
 
 	return 0;
@@ -157,7 +163,7 @@ static void conn_shutdown_tls(connection* conn) {
 	tls_connection* tls_conn = (tls_connection*)conn;
 
 	if (tls_conn->ssl) {
-		SSL_shutdown(tls_conn->ssl);
+		SSL_set_quiet_shutdown(tls_conn->ssl, 1);
 		SSL_free(tls_conn->ssl);
 
 		tls_conn->ssl = NULL;
@@ -171,7 +177,7 @@ static void conn_close_tls(connection* conn) {
 	tls_connection* tls_conn = (tls_connection*)conn;
 
 	if (tls_conn->ssl) {
-		SSL_shutdown(tls_conn->ssl);
+		SSL_set_quiet_shutdown(tls_conn->ssl, 1);
 		SSL_free(tls_conn->ssl);
 
 		tls_conn->ssl = NULL;
@@ -187,13 +193,11 @@ static int conn_write_tls(connection* conn, const void* data, size_t data_len) {
 		return -EINVAL;
 	}
 
-	int ret = SSL_write(tls_conn->ssl, data, data_len);
-	if (ret < 0) {
-		perror("SSL write error");
-		return -errno;
-	}
-
-	return 0;
+	int ret = SSL_write(tls_conn->ssl, data, data_len > INT_MAX ? INT_MAX : (int)data_len);
+	if (ret > 0)
+		return ret;
+	int error = SSL_get_error(tls_conn->ssl, ret);
+	return error == SSL_ERROR_WANT_READ || error == SSL_ERROR_WANT_WRITE ? -EAGAIN : -EIO;
 }
 
 static int conn_writev_tls(connection* conn, const struct iovec* iov, int iovcnt) {
@@ -204,7 +208,7 @@ static int conn_writev_tls(connection* conn, const struct iovec* iov, int iovcnt
 	}
 
 	size_t iov_bytes_len = 0;
-	for (int i = 0; i < 3; i++) {
+	for (int i = 0; i < iovcnt; i++) {
 		iov_bytes_len += iov[i].iov_len;
 	}
 
@@ -220,11 +224,7 @@ static int conn_writev_tls(connection* conn, const struct iovec* iov, int iovcnt
 		offset += iov[i].iov_len;
 	}
 
-	int ret = SSL_write(tls_conn->ssl, ssl_buf, iov_bytes_len);
-	if (ret < 0) {
-		perror("SSL writev error");
-		ret = -errno;
-	}
+	int ret = conn_write_tls(conn, ssl_buf, iov_bytes_len);
 
 	free(ssl_buf);
 	return ret;
@@ -238,14 +238,12 @@ static int conn_read_tls(connection* conn, void* buf, size_t buf_len) {
 	}
 
 	int ret = SSL_read(tls_conn->ssl, buf, buf_len);
-	if (ret <= 0) {
-		if (errno != EAGAIN) {
-			return -errno;
-		}
-
+	if (ret > 0)
+		return ret;
+	int error = SSL_get_error(tls_conn->ssl, ret);
+	if (error == SSL_ERROR_WANT_READ || error == SSL_ERROR_WANT_WRITE)
 		return -EAGAIN;
-	}
-	return ret;
+	return error == SSL_ERROR_ZERO_RETURN ? 0 : -EIO;
 }
 
 static connection_type CT_TLS = {

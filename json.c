@@ -29,33 +29,59 @@
 #include "output.h"
 
 #define LEN_HP_SIZE	64
-#define LINE_BUF_SIZE	1024
+#define LINE_BUF_SIZE	4096
 
-static void json_print_CPU();
-static void json_print_cpu();
-static void json_print_CPL();
-static void json_print_GPU();
-static void json_print_MEM();
-static void json_print_SWP();
-static void json_print_PAG();
-static void json_print_PSI();
-static void json_print_LVM();
-static void json_print_MDD();
-static void json_print_DSK();
-static void json_print_NFM();
-static void json_print_NFC();
-static void json_print_NFS();
-static void json_print_NET();
-static void json_print_IFB();
-static void json_print_NUM();
-static void json_print_NUC();
-static void json_print_LLC();
-static void json_print_PRG();
-static void json_print_PRC();
-static void json_print_PRM();
-static void json_print_PRD();
-static void json_print_PRN();
-static void json_print_PRE();
+#define DECLARE_JSON_PRINTER(name) \
+	static void json_print_##name(int, char *, struct sstat *, struct tstat *, int)
+DECLARE_JSON_PRINTER(CPU);
+DECLARE_JSON_PRINTER(cpu);
+DECLARE_JSON_PRINTER(CPL);
+DECLARE_JSON_PRINTER(GPU);
+DECLARE_JSON_PRINTER(MEM);
+DECLARE_JSON_PRINTER(SWP);
+DECLARE_JSON_PRINTER(PAG);
+DECLARE_JSON_PRINTER(PSI);
+DECLARE_JSON_PRINTER(LVM);
+DECLARE_JSON_PRINTER(MDD);
+DECLARE_JSON_PRINTER(DSK);
+DECLARE_JSON_PRINTER(NFM);
+DECLARE_JSON_PRINTER(NFC);
+DECLARE_JSON_PRINTER(NFS);
+DECLARE_JSON_PRINTER(NET);
+DECLARE_JSON_PRINTER(IFB);
+DECLARE_JSON_PRINTER(NUM);
+DECLARE_JSON_PRINTER(NUC);
+DECLARE_JSON_PRINTER(LLC);
+DECLARE_JSON_PRINTER(PRG);
+DECLARE_JSON_PRINTER(PRC);
+DECLARE_JSON_PRINTER(PRM);
+DECLARE_JSON_PRINTER(PRD);
+DECLARE_JSON_PRINTER(PRN);
+DECLARE_JSON_PRINTER(PRE);
+#undef DECLARE_JSON_PRINTER
+
+static void json_escape(const char *src, size_t max, char *dst, size_t size)
+{
+	static const char hex[] = "0123456789abcdef";
+	size_t j = 0;
+	for (size_t i = 0; i < max && src[i] && j + 7 < size; i++) {
+		unsigned char c = src[i];
+		if (c == '"' || c == '\\') {
+			dst[j++] = '\\';
+			dst[j++] = c;
+		} else if (c < 0x20) {
+			dst[j++] = '\\';
+			dst[j++] = 'u';
+			dst[j++] = '0';
+			dst[j++] = '0';
+			dst[j++] = hex[c >> 4];
+			dst[j++] = hex[c & 15];
+		} else {
+			dst[j++] = c;
+		}
+	}
+	dst[j] = 0;
+}
 
 /*
 ** table with possible labels and the corresponding
@@ -87,7 +113,7 @@ static int jsondef(char *pd, struct labeldef *labeldef, int numlabels)
 		if ((p = strchr(pd, ',')))
 			*p = 0;
 		else
-			p = ep - 1;
+			p = ep;
 
 		/*
 		** check if the next label exists
@@ -114,7 +140,7 @@ static int jsondef(char *pd, struct labeldef *labeldef, int numlabels)
 			}
 		}
 
-		pd = p + 1;
+		pd = p < ep ? p + 1 : ep;
 	}
 
 	return 0;
@@ -124,8 +150,7 @@ int jsonout(int flags, char *pd, time_t curtime, int numsecs,
          struct devtstat *devtstat, struct sstat *sstat,
          int nexit, unsigned int noverflow, char flag, connection *conn)
 {
-	char header[256], general[256];
-	struct tstat *tmp = devtstat->taskall;
+	char header[256], general[512], host[sizeof(utsname.nodename) * 6 + 1];
 	int buflen = 0;
 	int i, ret;
 
@@ -166,32 +191,17 @@ int jsonout(int flags, char *pd, time_t curtime, int numsecs,
 		return ret;
 	}
 
+	json_escape(utsname.nodename, sizeof(utsname.nodename), host, sizeof(host));
 	buflen = snprintf(general, sizeof(general),
 			"{\"host\": \"%s\", "
 			"\"timestamp\": %ld, "
 			"\"elapsed\": %d",
-			utsname.nodename,
+			host,
 			curtime,
 			numsecs
 			);
 
 	output_samp(&defop, general, buflen);
-
-	/* Replace " with # in case json can not parse this out */
-	for (int k = 0; k < devtstat->ntaskall; k++, tmp++) {
-		for (int j = 0; (j < sizeof(tmp->gen.name)) && tmp->gen.name[j]; j++)
-			if ((tmp->gen.name[j] == '\"') || (tmp->gen.name[j] == '\\'))
-				tmp->gen.name[j] = '#';
-
-		if (hidecmdline) {
-			strcpy(tmp->gen.cmdline, "***");
-			continue;
-		}
-
-		for (int j = 0; (j < sizeof(tmp->gen.cmdline) && tmp->gen.cmdline[j]); j++)
-			if ((tmp->gen.cmdline[j] == '\"') || (tmp->gen.cmdline[j] == '\\'))
-				tmp->gen.cmdline[j] = '#';
-	}
 
 	for (i = 0; i < numlabels; i++) {
 		if (!labeldef[i].valid)
@@ -259,7 +269,7 @@ static void json_print_CPU(int flags, char *hp, struct sstat *ss, struct tstat *
 
 	buflen = snprintf(buf, sizeof(buf), ", %s: {"
 		"\"hertz\": %u, "
-		"\"nrcpu\": %lld, "
+		"\"nrcpu\": %d, "
 		"\"stime\": %lld, "
 		"\"utime\": %lld, "
 		"\"ntime\": %lld, "
@@ -453,9 +463,9 @@ static void json_print_MEM(int flags, char *hp, struct sstat *ss, struct tstat *
 		ss->mem.shmrss * pagesize,
 		ss->mem.shmswp * pagesize,
 		ss->mem.pagetables * pagesize,
-		ss->mem.hugepagesz,
-		ss->mem.tothugepage,
-		ss->mem.freehugepage,
+		ss->mem.shugepagesz,
+		ss->mem.stothugepage,
+		ss->mem.sfreehugepage,
 		ss->mem.tcpsock * pagesize,
 		ss->mem.udpsock * pagesize);
 
@@ -937,7 +947,7 @@ static void json_print_NUM(int flags, char *hp, struct sstat *ss, struct tstat *
 			ss->memnuma.numa[i].slabmem * pagesize,
 			ss->memnuma.numa[i].slabreclaim * pagesize,
 			ss->memnuma.numa[i].shmem * pagesize,
-			ss->memnuma.numa[i].tothp * ss->mem.hugepagesz);
+			ss->memnuma.numa[i].tothp * ss->mem.shugepagesz);
 		output_samp(&defop, buf, buflen);
 	}
 
@@ -1020,8 +1030,12 @@ static void json_print_LLC(int flags, char *hp, struct sstat *ss, struct tstat *
 static void json_print_PRG(int flags, char *hp, struct sstat *ss, struct tstat *ps, int nact)
 {
 	int i, exitcode;
+	int printed = 0;
 	int buflen = 0;
 	char buf[LINE_BUF_SIZE];
+	char name[sizeof(ps->gen.name) * 6 + 1];
+	char cmdline[sizeof(ps->gen.cmdline) * 6 + 1];
+	char cid[sizeof(ps->gen.utsname) * 6 + 1];
 	char br[LEN_HP_SIZE];
 	buflen = sprintf(br, ", %s: [", hp);
 	output_samp(&defop, br, buflen);
@@ -1053,13 +1067,17 @@ static void json_print_PRG(int flags, char *hp, struct sstat *ss, struct tstat *
 			st[1] = 'E';
 		}
 
-		if (i > 0) {
+		if (printed++) {
 			output_samp(&defop, ", ", 2);
 		}
+		json_escape(ps->gen.name, sizeof(ps->gen.name), name, sizeof(name));
+		json_escape(hidecmdline ? "***" : ps->gen.cmdline,
+			hidecmdline ? 3 : sizeof(ps->gen.cmdline), cmdline, sizeof(cmdline));
+		json_escape(ps->gen.utsname, sizeof(ps->gen.utsname), cid, sizeof(cid));
 
 		/* using getpwuid() & getpwuid to convert ruid & euid to string seems better, but the two functions take a long time */
 		buflen = snprintf(buf, sizeof(buf), "{\"pid\": %d, "
-			"\"name\": \"(%.19s)\", "
+			"\"name\": \"(%s)\", "
 			"\"state\": \"%c\", "
 			"\"ruid\": %d, "
 			"\"rgid\": %d, "
@@ -1068,7 +1086,7 @@ static void json_print_PRG(int flags, char *hp, struct sstat *ss, struct tstat *
 			"\"st\": \"%s\", "
 			"\"exitcode\": %d, "
 			"\"btime\": \"%ld\", "
-			"\"cmdline\": \"(%.130s)\", "
+			"\"cmdline\": \"(%s)\", "
 			"\"ppid\": %d, "
 			"\"nthrrun\": %d, "
 			"\"nthrslpi\": %d, "
@@ -1077,9 +1095,9 @@ static void json_print_PRG(int flags, char *hp, struct sstat *ss, struct tstat *
 			"\"egid\": %d, "
 			"\"elaps\": \"%ld\", "
 			"\"isproc\": %d, "
-			"\"cid\": \"%.19s\"}",
+			"\"cid\": \"%s\"}",
 			ps->gen.pid,
-			ps->gen.name,
+			name,
 			ps->gen.state,
 			ps->gen.ruid,
 			ps->gen.rgid,
@@ -1088,7 +1106,7 @@ static void json_print_PRG(int flags, char *hp, struct sstat *ss, struct tstat *
 			st,
 			exitcode,
 			ps->gen.btime,
-			ps->gen.cmdline,
+			cmdline,
 			ps->gen.ppid,
 			ps->gen.nthrrun,
 			ps->gen.nthrslpi,
@@ -1097,7 +1115,7 @@ static void json_print_PRG(int flags, char *hp, struct sstat *ss, struct tstat *
 			ps->gen.egid,
 			ps->gen.elaps,
 			!!ps->gen.isproc, /* convert to boolean */
-			ps->gen.container[0] ? ps->gen.container:"-");
+			ps->gen.utsname[0] ? cid:"-");
 		output_samp(&defop, buf, buflen);
 	}
 
@@ -1107,6 +1125,7 @@ static void json_print_PRG(int flags, char *hp, struct sstat *ss, struct tstat *
 static void json_print_PRC(int flags, char *hp, struct sstat *ss, struct tstat *ps, int nact)
 {
 	int i;
+	int printed = 0;
 	int buflen = 0;
 	char buf[LINE_BUF_SIZE];
 
@@ -1117,7 +1136,7 @@ static void json_print_PRC(int flags, char *hp, struct sstat *ss, struct tstat *
 	for (i = 0; i < nact; i++, ps++) {
 		if (ps->gen.tgid == ps->gen.pid && !ps->gen.isproc)
 			continue;
-		if (i > 0) {
+		if (printed++) {
 			output_samp(&defop, ", ", 2);
 		}
 		buflen = snprintf(buf, sizeof(buf), "{\"pid\": %d, "
@@ -1151,6 +1170,7 @@ static void json_print_PRC(int flags, char *hp, struct sstat *ss, struct tstat *
 static void json_print_PRM(int flags, char *hp, struct sstat *ss, struct tstat *ps, int nact)
 {
 	int i;
+	int printed = 0;
 	int buflen = 0;
 	char buf[LINE_BUF_SIZE];
 
@@ -1161,7 +1181,7 @@ static void json_print_PRM(int flags, char *hp, struct sstat *ss, struct tstat *
 	for (i = 0; i < nact; i++, ps++) {
 		if (ps->gen.tgid == ps->gen.pid && !ps->gen.isproc)
 			continue;
-		if (i > 0) {
+		if (printed++) {
 			output_samp(&defop, ", ", 2);
 		}
 		buflen = snprintf(buf, sizeof(buf), "{\"pid\": %d, "
@@ -1202,6 +1222,7 @@ static void json_print_PRM(int flags, char *hp, struct sstat *ss, struct tstat *
 static void json_print_PRD(int flags, char *hp, struct sstat *ss, struct tstat *ps, int nact)
 {
 	int i;
+	int printed = 0;
 	int buflen = 0;
 	char buf[LINE_BUF_SIZE];
 
@@ -1212,7 +1233,7 @@ static void json_print_PRD(int flags, char *hp, struct sstat *ss, struct tstat *
 	for (i = 0; i < nact; i++, ps++) {
 		if (ps->gen.tgid == ps->gen.pid && !ps->gen.isproc)
 			continue;
-		if (i > 0) {
+		if (printed++) {
 			output_samp(&defop, ", ", 2);
 		}
 		buflen = snprintf(buf, sizeof(buf), "{\"pid\": %d, "
@@ -1232,10 +1253,11 @@ static void json_print_PRD(int flags, char *hp, struct sstat *ss, struct tstat *
 
 static void json_print_PRN(int flags, char *hp, struct sstat *ss, struct tstat *ps, int nact)
 {
-	if (!(flags & NETATOP))
+	if (!(flags & (NETATOP | NETATOPD | NETATOPBPF)))
 		return;
 
 	int i;
+	int printed = 0;
 	int buflen = 0;
 	char buf[LINE_BUF_SIZE];
 
@@ -1246,7 +1268,7 @@ static void json_print_PRN(int flags, char *hp, struct sstat *ss, struct tstat *
 	for (i = 0; i < nact; i++, ps++) {
 		if (ps->gen.tgid == ps->gen.pid && !ps->gen.isproc)
 			continue;
-		if (i > 0) {
+		if (printed++) {
 			output_samp(&defop, ", ", 2);
 		}
 		buflen = snprintf(buf, sizeof(buf), "{\"pid\": %d, "
@@ -1275,6 +1297,7 @@ static void json_print_PRE(int flags, char *hp, struct sstat *ss, struct tstat *
 		return;
 
 	int i;
+	int printed = 0;
 	int buflen = 0;
 	char buf[LINE_BUF_SIZE];
 
@@ -1285,15 +1308,15 @@ static void json_print_PRE(int flags, char *hp, struct sstat *ss, struct tstat *
 	for (i = 0; i < nact; i++, ps++) {
 		if (ps->gen.tgid == ps->gen.pid && !ps->gen.isproc)
 			continue;
-		if (i > 0) {
+		if (printed++) {
 			output_samp(&defop, ", ", 2);
 		}
 		buflen = snprintf(buf, sizeof(buf), "{\"pid\": %d, "
 			"\"gpustate\": \"%c\", "
 			"\"nrgpus\": %d, "
 			"\"gpulist\": \"%x\", "
-			"\"gpubusy\": %d, "
-			"\"membusy\": %d, "
+			"\"gpubusy\": %lld, "
+			"\"membusy\": %lld, "
 			"\"memnow\": %lld, "
 			"\"memcum\": %lld, "
 			"\"sample\": %lld}",
@@ -1301,11 +1324,11 @@ static void json_print_PRE(int flags, char *hp, struct sstat *ss, struct tstat *
 			ps->gpu.state == '\0' ? 'N':ps->gpu.state,
 			ps->gpu.nrgpus,
 			ps->gpu.gpulist,
-			ps->gpu.gpubusy,
-			ps->gpu.membusy,
+			ps->gpu.samples > 0 ? ps->gpu.gpubusycum / ps->gpu.samples : 0,
+			ps->gpu.samples > 0 ? ps->gpu.membusycum / ps->gpu.samples : 0,
 			ps->gpu.memnow,
 			ps->gpu.memcum,
-			ps->gpu.sample);
+			ps->gpu.samples);
 		output_samp(&defop, buf, buflen);
 	}
 

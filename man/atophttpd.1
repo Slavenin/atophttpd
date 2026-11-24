@@ -1,16 +1,19 @@
-.TH ATOPHTTPD 1 "Jan 2023" "Linux"
+.TH ATOPHTTPD 1 "Oct 2026" "Linux"
 .SH NAME
 .B atophttpd
 - A web style atop(https://www.atoptool.nl)
 .SH SYNOPSIS
 .B atophttpd
-[\-h] [\-d] [\-D] [\-H] [-p PORT] [-P PATH]
+[\-h] [\-d] [\-D] [\-H] [\-p PORT] [\-P PATH] [\-S SECONDS]
 .SH DESCRIPTION
 .I atophttpd
 depends on atop and reads atop rawlog, provides web
 service(HTTP 1.1). A user accesses atop by a web browser without
 login permission of a server, it's also possible to get/analyze
 statistics of many servers in batch.
+The /metrics endpoint exports process TCP and UDP receive/transmit bytes per
+second for Prometheus. Process metrics require atop process-network data
+from a compatible collector and atop started with \-K.
 
 Since atophttpd access the rawlog of atop, this daemon requires the
 permission of
@@ -36,6 +39,25 @@ Listen to PORT, default 2867.
 Specify atop log path, default
 .B
 /var/log/atop.
+.TP
+\-S SECONDS
+Override the Prometheus sample freshness limit. By default, it is the
+greater of 30 seconds and twice the atop sample interval.
+.TP
+\-a ADDR
+Bind HTTP to ADDR, default 127.0.0.1.
+.TP
+\-t PORT
+Enable mutual TLS on PORT. TLS support requires a build with USE_TLS=YES.
+.SH METRICS
+The /metrics endpoint returns interval gauges named
+.B atophttpd_process_network_receive_bytes_per_second
+and
+.B atophttpd_process_network_transmit_bytes_per_second.
+The labels are host, pid, name, start_time and protocol. Status gauges report
+sample timestamp, interval, age, freshness and process-network availability.
+If no complete sample is available, no process series are returned; a malformed
+indexed sample returns HTTP 503. Do not apply Prometheus rate() to these gauges.
 .SH SOURCE
 https://github.com/pizhenwei/atophttpd
 .SH OS

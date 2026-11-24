@@ -1,0 +1,155 @@
+services:
+  prometheus:
+    image: prom/prometheus:latest
+    container_name: prometheus
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ./data/prometheus_data:/prometheus:rw
+    command:
+      - '--config.file=/etc/prometheus/prometheus.yml'
+      - '--storage.tsdb.path=/prometheus'
+    networks:
+      - monitoring-network
+    restart: unless-stopped
+
+  grafana:
+    image: grafana/grafana:latest
+    container_name: grafana
+    ports:
+      - "3010:3000"
+    volumes:
+      - ./data/grafana_data:/var/lib/grafana:rw
+    networks:
+      - monitoring-network
+    depends_on:
+      - prometheus
+    restart: unless-stopped
+
+  process-exporter:
+    image: ncabatoff/process-exporter:latest
+    container_name: process-exporter
+    privileged: true  # КРИТИЧЕСКИ ВАЖНО
+    ports:
+      - "9256:9256"
+    volumes:
+      # Монтируем /proc хоста в другую точку, чтобы избежать конфликтов
+      - "/proc:/host/proc:ro"
+      - "./process-exporter/process-exporter.yml:/config.yml:ro"
+    command:
+      - '-config.path=/config.yml'
+      - '-procfs=/host/proc'
+      - '-recheck'
+      - '-remove-empty-groups'
+    pid: host
+    networks:
+      - monitoring-network
+    restart: unless-stopped
+
+  node-exporter:
+    # Use the official Prometheus Node Exporter image
+    image: prom/node-exporter:latest
+    container_name: node-exporter
+    networks:
+      - monitoring-network
+    pid: host
+    # Map port 9100 for accessing the metrics endpoint
+    ports:
+      - "9100:9100"
+    volumes:
+      - /proc:/host/proc:ro
+      - /sys:/host/sys:ro
+    command:
+      - '--path.procfs=/host/proc'
+      - '--path.sysfs=/host/sys'
+    restart: unless-stopped
+
+  atop-collector:
+    build:
+      context: ./atop-collector
+      additional_contexts:
+        atophttpd_source: ${LOCAL_ATOPHTTPD_SOURCE:-/home/max/projects/atophttpd}
+        netatop_source: ${LOCAL_NETATOP_SOURCE:-./netatop-bpf}
+    container_name: atop-collector
+    pid: host
+    uts: host
+    network_mode: none
+    cap_drop:
+      - ALL
+    cap_add:
+      - BPF
+      - PERFMON
+      - SYS_RESOURCE
+    read_only: true
+    tmpfs:
+      - /run:mode=1777
+      - /tmp:mode=1777
+    volumes:
+      - atop-logs:/var/log/atop:rw
+      - /sys/kernel/btf:/sys/kernel/btf:ro
+      - /sys/kernel/tracing:/sys/kernel/tracing:ro
+      - /sys/fs/cgroup:/sys/fs/cgroup:ro
+    environment:
+      ATOP_INTERVAL_SECONDS: ${ATOP_INTERVAL_SECONDS:-10}
+      ATOP_RETENTION_DAYS: ${ATOP_RETENTION_DAYS:-7}
+    healthcheck:
+      test: ["CMD", "python3", "/usr/local/lib/atop-collector/health.py"]
+      interval: 10s
+      timeout: 3s
+      retries: 3
+      start_period: 35s
+    stop_grace_period: 20s
+    restart: unless-stopped
+
+  atophttpd:
+    build:
+      context: ./atophttpd
+      additional_contexts:
+        atophttpd_source: ${LOCAL_ATOPHTTPD_SOURCE:-/home/max/projects/atophttpd}
+    container_name: atophttpd
+    user: "65534:65534"
+    read_only: true
+    cap_drop:
+      - ALL
+    ports:
+      - "127.0.0.1:9080:2867"
+    volumes:
+      - atop-logs:/var/log/atop:ro
+    networks:
+      - monitoring-network
+    depends_on:
+      atop-collector:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "--silent", "--max-time", "3", "http://127.0.0.1:2867/health"]
+      interval: 10s
+      timeout: 8s
+      retries: 3
+      start_period: 25s
+    restart: unless-stopped
+
+  # netdata:
+  #   image: netdata/netdata:latest
+  #   container_name: netdata
+  #   pid: host
+  #   network_mode: host
+  #   cap_add:
+  #     - SYS_PTRACE
+  #     - SYS_ADMIN
+  #   security_opt:
+  #     - apparmor:unconfined
+  #   volumes:
+  #     - /proc:/host/proc:ro
+  #     - /sys:/host/sys:ro
+  #     - /var/run/docker.sock:/var/run/docker.sock:ro
+  #   restart: unless-stopped
+
+networks:
+  monitoring-network:
+    driver: bridge
+
+volumes:
+  atop-logs:

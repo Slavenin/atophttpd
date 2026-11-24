@@ -3,15 +3,14 @@
 # Generate some test certificates which are used by the regression test suite:
 #
 #   tls/ca.{crt,key}          Self signed CA certificate.
-#   tls/atophttpd.{crt,key}       A certificate with no key usage/policy restrictions.
+#   tls/atophttpd.{crt,key}   A certificate for both server and client usage.
 #   tls/client.{crt,key}      A certificate restricted for SSL client usage.
 #   tls/server.{crt,key}      A certificate restricted for SSL server usage.
-#   tls/atophttpd.dh              DH Params file.
+#   tls/atophttpd.dh          DH Params file.
 
 generate_cert() {
     local name=$1
     local cn=$2
-    local opts="$3"
 
     local keyfile=tls/${name}.key
     local certfile=tls/${name}.crt
@@ -28,14 +27,15 @@ generate_cert() {
             -CAserial tls/ca.txt \
             -CAcreateserial \
             -days 365 \
-            $opts \
+            -extfile tls/openssl.cnf \
+            -extensions "$name" \
             -out $certfile
 }
 
 read -p "Enter DNS name: " DNS
 read -p "Enter IP address: " IP
 
-SAN="DNS:localhost"
+SAN="DNS:localhost,IP:127.0.0.1"
 if [ ! -z "$DNS" ]; then
     SAN="$SAN,DNS:$DNS"
 fi
@@ -51,21 +51,31 @@ openssl req \
     -key tls/ca.key \
     -days 3650 \
     -subj '/O=Atophttpd Test/CN=Certificate Authority' \
+    -addext 'basicConstraints=critical,CA:TRUE' \
+    -addext 'keyUsage=critical,keyCertSign,cRLSign' \
     -out tls/ca.crt
 
 cat > tls/openssl.cnf <<_END_
-[ server_cert ]
-keyUsage = digitalSignature, keyEncipherment
-nsCertType = server
+[ server ]
+basicConstraints = critical,CA:FALSE
+keyUsage = critical,digitalSignature,keyEncipherment
+extendedKeyUsage = serverAuth
 subjectAltName = ${SAN}
 
-[ client_cert ]
-keyUsage = digitalSignature, keyEncipherment
-nsCertType = client
+[ client ]
+basicConstraints = critical,CA:FALSE
+keyUsage = critical,digitalSignature
+extendedKeyUsage = clientAuth
+
+[ atophttpd ]
+basicConstraints = critical,CA:FALSE
+keyUsage = critical,digitalSignature,keyEncipherment
+extendedKeyUsage = serverAuth,clientAuth
+subjectAltName = ${SAN}
 _END_
 
-generate_cert server "Server-only" "-extfile tls/openssl.cnf -extensions server_cert"
-generate_cert client "Client-only" "-extfile tls/openssl.cnf -extensions client_cert"
+generate_cert server "Server-only"
+generate_cert client "Client-only"
 generate_cert atophttpd "Generic-cert"
 
 [ -f tls/atophttpd.dh ] || openssl dhparam -out tls/atophttpd.dh 2048

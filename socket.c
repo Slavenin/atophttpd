@@ -100,12 +100,10 @@ static int conn_socket_read(struct connection* conn, void* buf, size_t buf_len) 
 		return -EINVAL;
 
 	int ret = read(conn->fd, buf, buf_len);
-	if (ret <= 0) {
-		if (errno != EAGAIN) {
-			return -errno;
-		}
-		return -EAGAIN;
-	}
+	if (ret == 0)
+		return 0;
+	if (ret < 0)
+		return errno == EAGAIN || errno == EINTR ? -EAGAIN : -errno;
 
 	return ret;
 }

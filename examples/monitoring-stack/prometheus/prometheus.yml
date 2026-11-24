@@ -1,0 +1,35 @@
+global:
+  scrape_interval: 10s
+  evaluation_interval: 10s
+
+scrape_configs:
+  - job_name: 'prometheus'
+    static_configs:
+      - targets: ['localhost:9090']
+
+  - job_name: 'process-exporter'
+    static_configs:
+      - targets: ['process-exporter:9256']
+
+  - job_name: 'node_exporter'
+    static_configs:
+      - targets: ['node-exporter:9100']
+
+  - job_name: 'atophttpd'
+    scrape_interval: 10s
+    static_configs:
+      - targets: ['atophttpd:2867']
+
+  # - job_name: 'netdata'
+  #   metrics_path: '/api/v1/allmetrics'
+  #   params:
+  #     format: [prometheus]
+  #     # sources: as-collected | raw | average | sum | volume
+  #     # default is: average
+  #     #source: [as-collected]
+  #     # server name for this prometheus - the default is the client IP
+  #     # for Netdata to uniquely identify it
+  #     server: ['home']
+  #   honor_labels: true
+  #   static_configs:
+  #     - targets: ['host.docker.internal:19999']

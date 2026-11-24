@@ -24,13 +24,19 @@ static void output_buf(struct output *op, char *buf, int size)
 	{
 		op->ob.size = OUTBUF_DEF_SIZE;
 		op->ob.buf = calloc(1, op->ob.size);
+		if (!op->ob.buf)
+			exit(ENOMEM);
 	}
 
 	/* no enought buf, grow it */
 	if (op->ob.size - op->ob.offset < size)
 	{
-		op->ob.size *= 2;
-		op->ob.buf = realloc(op->ob.buf, op->ob.size);
+		while (op->ob.size - op->ob.offset < size)
+			op->ob.size *= 2;
+		char *grown = realloc(op->ob.buf, op->ob.size);
+		if (!grown)
+			exit(ENOMEM);
+		op->ob.buf = grown;
 	}
 
 	memcpy(op->ob.buf + op->ob.offset, buf, size);
@@ -42,11 +48,18 @@ void output_samp(struct output *op, char *buf, int size)
 	switch (op->output_type)
 	{
 		case OUTPUT_STDOUT:
-		printf("%s", buf);
+			fwrite(buf, 1, size, stdout);
 		break;
 
 		case OUTPUT_FD:
-		write(op->fd, buf, size);
+			for (int off = 0; off < size;) {
+				ssize_t written = write(op->fd, buf + off, size - off);
+				if (written < 0 && errno == EINTR)
+					continue;
+				if (written <= 0)
+					break;
+				off += written;
+			}
 		break;
 
 		case OUTPUT_BUF:

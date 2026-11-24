@@ -234,7 +234,7 @@ function main() {
             loading = false
             change_data = false
             change_template = false
-        })
+        }).catch(showRequestError).finally(() => { loading = false })
         return
     } else {
         delta = 0
@@ -246,8 +246,27 @@ function main() {
             loading = false
             change_data = false
             change_template = false
-        })
+        }).catch(showRequestError).finally(() => { loading = false })
     }
+}
+
+function showRequestError(error) {
+    console.error("atophttpd request failed", error)
+    while (p = queue.shift()) {
+        p.reject(error)
+    }
+}
+
+function requestText(url) {
+    return new Promise((resolve, reject) => {
+        const request = new XMLHttpRequest()
+        request.open("GET", url, true)
+        request.timeout = 5000
+        request.onload = () => request.status === 200 ? resolve(request.responseText) : reject(new Error("HTTP " + request.status + " " + url))
+        request.onerror = () => reject(new Error("Network error " + url))
+        request.ontimeout = () => reject(new Error("Timeout " + url))
+        request.send()
+    })
 }
 
 function constructTemplate(template_header, template_process) {
@@ -263,22 +282,11 @@ function getHtmlTemplateProcessFromServer(req_timestamp, req_template_type, req_
             loading = true
 
             if (req_change_template) {
-                host = document.location.host;
-                var url = "http://" + host + "/template?type=" + req_template_type;
-                var request = new XMLHttpRequest();
-
-                request.open("GET", url, true);
-                request.send();
-                request.onload = function () {
-                    if (request.status === 200) {
-                        raw_template_process = request.responseText;
-                        cache_template_process = raw_template_process
-                        resolve({
-                            req_timestamp,
-                            req_change_data
-                        })
-                    }
-                }
+                requestText("/template?type=" + encodeURIComponent(req_template_type)).then(text => {
+                    raw_template_process = text
+                    cache_template_process = text
+                    resolve({ req_timestamp, req_change_data })
+                }, reject)
             } else {
                 resolve({ req_timestamp, req_change_data })
             }
@@ -289,25 +297,13 @@ function getHtmlTemplateProcessFromServer(req_timestamp, req_template_type, req_
 function getHtmlTemplateHeaderFromServer(paras) {
     return new Promise((resolve, reject) => {
         if (init) {
-            host = document.location.host;
-            var url = "http://" + host + "/template_header"
-            var request = new XMLHttpRequest();
-
             var req_timestamp = paras.req_timestamp
             var req_change_data = paras.req_change_data
-
-            request.open("GET", url, true);
-            request.send();
-            request.onload = function () {
-                if (request.status === 200) {
-                    raw_template_header = request.responseText;
-                    cache_template_header = raw_template_header
-                    resolve({
-                        req_timestamp,
-                        req_change_data
-                    })
-                }
-            }
+            requestText("/template_header").then(text => {
+                raw_template_header = text
+                cache_template_header = text
+                resolve({ req_timestamp, req_change_data })
+            }, reject)
         } else {
             resolve({ req_timestamp, req_change_data })
         }
@@ -317,19 +313,11 @@ function getHtmlTemplateHeaderFromServer(paras) {
 function getJsonRawDataFromServer(paras) {
     return new Promise((resolve, reject) => {
         if (paras.req_change_data) {
-            host = document.location.host;
-            var url = "http://" + host + "/showsamp?timestamp=" + paras.req_timestamp + "&lables=ALL";
-            var request = new XMLHttpRequest();
-
-            request.open("GET", url, true);
-            request.send();
-            request.onload = function () {
-                if (request.status === 200) {
-                    raw_json = request.responseText;
-                    cache_json_data = raw_json
-                    resolve()
-                }
-            }
+            requestText("/showsamp?timestamp=" + encodeURIComponent(paras.req_timestamp) + "&lables=ALL").then(text => {
+                raw_json = text
+                cache_json_data = text
+                resolve()
+            }, reject)
         } else {
             resolve()
         }

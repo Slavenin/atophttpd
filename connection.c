@@ -93,7 +93,7 @@ int get_conntype_index_by_name(const char* typename) {
 
 int listen_to_port(int port, char* bindaddr, int af) {
 	struct addrinfo hints;
-	struct addrinfo *res, *p;
+	struct addrinfo *res = NULL, *p;
 	int ret, sockfd = -1;
 	char _port[6];
 	static const int reuse = 1;
@@ -159,6 +159,7 @@ error:
 	}
 
 end:
-	freeaddrinfo(res);
+	if (res)
+		freeaddrinfo(res);
 	return sockfd;
 }

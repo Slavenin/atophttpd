@@ -53,6 +53,8 @@ dkms.conf
 
 # target binary file
 atophttpd
+/build/
+__pycache__/
 
 # development
 tags
