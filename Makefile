@@ -1,79 +1,107 @@
-CC ?= cc
-CPPFLAGS += -I. -Iatop
-CFLAGS ?= -O2 -g
-CFLAGS += -Wall -Wcast-align -std=gnu11
-LDFLAGS ?=
-LDLIBS += -lz
+# Base build flags.
+CFLAGS = -Iatop -g -O2 -Wall -Wcast-align -std=gnu11 -pthread
+# Hardening flags, matching Debian's dpkg-buildflags defaults: stack canaries,
+# fortified libc calls, a position-independent executable (full ASLR), and a
+# read-only GOT resolved at startup (full RELRO).
+HARDEN_CFLAGS = -D_FORTIFY_SOURCE=2 -fstack-protector-strong -fPIE \
+               -Wformat -Werror=format-security
+HARDEN_LDFLAGS = -pie -Wl,-z,relro -Wl,-z,now
+CFLAGS += $(HARDEN_CFLAGS)
+LDFLAGS += $(HARDEN_LDFLAGS)
+LDLIBS = -lz
+OBJS = cache.o httpd.o json.o metrics.o output.o rawlog.o version.o connection.o socket.o tls.o http_args.o log.o
+BIN = atophttpd
+PREFIX := $(prefix)
+CC=gcc
+CLANGFMT = clang-format-18
+
+# atop version atophttpd is compiled against. atophttpd parses atop's
+# version-specific binary raw-log format, so the source matches exactly ONE atop
+# release: v2.13.0 (the default, CI-tested). ATOP_VERSION only repoints the atop
+# submodule -- it does NOT adapt the source -- so override it only together with
+# the matching atophttpd tag (see the README "Match the atop version" section).
+ATOP_VERSION ?= v2.13.0
 
 ifneq (,$(filter $(USE_TLS),yes YES y Y 1))
-MODE := tls
-CPPFLAGS += -DUSE_TLS
-LDLIBS += -lssl -lcrypto
-else
-MODE := plain
+	CFLAGS += -DUSE_TLS
+	LDLIBS += -lssl -lcrypto
 endif
 
-BUILD_DIR := build/$(MODE)
-SOURCES := cache.c httpd.c json.c metrics.c output.c rawlog.c connection.c socket.c tls.c
-OBJECTS := $(patsubst %.c,$(BUILD_DIR)/%.o,$(SOURCES)) $(BUILD_DIR)/version.o
-DEPS := $(OBJECTS:.o=.d)
-ASSETS := $(shell find http -type f)
-BIN := atophttpd
-PREFIX ?= $(prefix)
+all: bin
 
-.PHONY: all clean install deb submodule test FORCE
-all: $(BIN)
+install: bin
+	install -D -s $(BIN) $(PREFIX)/usr/bin/$(BIN)
+	install -D -m 0644 atophttpd.service $(PREFIX)/usr/lib/systemd/system/atophttpd.service
+	install -D -m 0644 packaging/debian/atophttpd.default $(PREFIX)/etc/default/atophttpd
+	install -D -m 0644 man/atophttpd.1 $(PREFIX)/usr/share/man/man1/atophttpd.1
 
-$(BIN): $(BUILD_DIR)/$(BIN) FORCE
-	cp $< $@
+deb: bin
+	@sh packaging/debian/makedeb.sh "$(CURDIR)"
 
-$(BUILD_DIR)/$(BIN): $(OBJECTS)
-	$(CC) $(LDFLAGS) -o $@ $^ $(LDLIBS)
+$(OBJS): | submodule
 
-$(BUILD_DIR)/%.o: %.c | atop/version.h
-	@mkdir -p $(BUILD_DIR)
-	$(CC) $(CPPFLAGS) $(CFLAGS) -MMD -MP -c $< -o $@
+bin: $(OBJS)
+	$(CC) -o $(BIN) $(OBJS) $(CFLAGS) $(LDFLAGS) $(LDLIBS)
 
-$(BUILD_DIR)/httpd.o: $(ASSETS)
+%.o: %.c
+	$(CC) -c $(CFLAGS) $*.c -o $*.o
 
-$(BUILD_DIR)/version.o: atop/version.c atop/version.h atop/versdate.h
-	@mkdir -p $(BUILD_DIR)
-	$(CC) $(CPPFLAGS) $(CFLAGS) -MMD -MP -c $< -o $@
-
-atop/version.h:
-	git submodule update --init --recursive
-	@test -f $@ || { echo 'atop submodule checkout failed' >&2; exit 1; }
-
-atop/version.c: atop/version.h
-	@test -f $@ || { echo 'atop version source is missing' >&2; exit 1; }
-
-atop/versdate.h: atop/version.h
-	$(MAKE) -C atop versdate.h
+version.o:
+	@make -C atop versdate.h
+	$(CC) -c $(CFLAGS) atop/version.c -o version.o
 
 submodule:
+ifeq ($(SKIP_SUBMODULE_UPDATE),1)
+	@test -f atop/version.h || { echo 'missing prepared atop source' >&2; exit 1; }
+	@actual=$$(sed -n 's/^#define[[:space:]]*ATOPVERS[[:space:]]*"\([^"]*\)".*/\1/p' atop/version.h); \
+		test "v$$actual" = "$(ATOP_VERSION)" || { echo "atop source version $$actual does not match $(ATOP_VERSION)" >&2; exit 1; }
+else
 	git submodule update --init --recursive
+	git -C atop fetch --tags --quiet || true
+	git -C atop checkout --quiet $(ATOP_VERSION)
+endif
 
-install: $(BIN)
-	install -D -m 755 $(BIN) $(DESTDIR)$(PREFIX)/usr/bin/$(BIN)
-	install -D -m 644 atophttpd.service $(DESTDIR)$(PREFIX)/lib/systemd/system/atophttpd.service
-	install -D -m 644 man/atophttpd.1 $(DESTDIR)$(PREFIX)/usr/share/man/man1/atophttpd.1
+# --- testing -------------------------------------------------------------
+# Build the atop submodule binary (used to generate raw-logs for the tests).
+atop-bin: submodule
+	@make -C atop versdate.h
+	@make -C atop atop
 
-deb: $(BIN)
-	sh packaging/debian/makedeb.sh "$(CURDIR)"
+unit: version.o
+	@make -C tests unit
 
-build/test/mkfixture: tests/mkfixture.c $(BUILD_DIR)/version.o
-	@mkdir -p build/test
-	$(CC) $(CPPFLAGS) $(CFLAGS) -o $@ $< $(BUILD_DIR)/version.o -lz
+integration: bin atop-bin
+	@make -C tests integration
 
-build/test/status: tests/test_status.c $(BUILD_DIR)/metrics.o
-	@mkdir -p build/test
-	$(CC) $(CPPFLAGS) $(CFLAGS) -o $@ $< $(BUILD_DIR)/metrics.o
+check: unit integration
 
-test: $(BIN) build/test/mkfixture build/test/status
-	build/test/status
-	python3 tests/test_integration.py
+# Full instrumented coverage run (unit + integration) with a threshold gate.
+# Override the threshold with: make coverage COV=85
+coverage:
+	@bash tests/coverage.sh $(or $(COV),90)
+
+# Build + run the whole suite under AddressSanitizer and UBSan.
+sanitize:
+	@bash tests/sanitize.sh
+
+# Build + run the whole suite under ThreadSanitizer (concurrency race gate).
+tsan:
+	@bash tests/tsan.sh
+
+# Build the libFuzzer harnesses (clang + ASan/UBSan) and run a short, bounded
+# session against the untrusted-input parsers. Override the per-target budget
+# with: make fuzz FUZZ_SECONDS=120 (or target a single one: make fuzz FUZZ=rawlog).
+fuzz:
+	@bash tests/fuzz.sh $(or $(FUZZ),all) $(or $(FUZZ_SECONDS),30)
+
+.PHONY: all install deb bin submodule atop-bin unit integration check coverage sanitize tsan fuzz clean
 
 clean:
-	rm -rf build $(BIN)
+	@rm -f $(BIN) *.o *.deb *.gcda *.gcno coverage.info
+	@rm -rf coverage
+	@make -C tests clean 2>/dev/null || true
 
--include $(DEPS)
+# Format all project sources with clang-format; keep the atop submodule
+# untouched so it stays pristine for upstream diffing.
+format:
+	@$(CLANGFMT) -i $(filter-out ./atop/%,$(shell find . -name '*.c' -o -name '*.h'))

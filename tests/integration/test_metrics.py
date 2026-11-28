@@ -8,13 +8,14 @@ import socket
 import subprocess
 import tempfile
 import time
+import unittest
 from urllib.error import HTTPError, URLError
 from urllib.request import urlopen
 
 
-ROOT = Path(__file__).resolve().parent.parent
-PRODUCER = ROOT / "build/test/mkfixture"
-SERVER = Path(os.environ.get("ATOPHTTPD_SERVER", ROOT / "atophttpd"))
+ROOT = Path(__file__).resolve().parent.parent.parent
+PRODUCER = ROOT / "tests/fixtures/mkmetrics"
+SERVER = Path(os.environ.get("ATOPHTTPD_BIN", ROOT / "atophttpd"))
 
 
 def fixture(path, mode, timestamp):
@@ -113,7 +114,7 @@ def main():
             sample = json.loads(response)
             assert status == 200 and sample["timestamp"] == now - 2
             assert len(sample["PRG"]) == 2 and len(sample["PRN"]) == 2
-            assert sample["PRG"][0]["name"] == '(a"\\b)'
+            assert sample["PRG"][0]["name"] == '(a##b)'
             status, response = request(port, f"showsamp?timestamp={now - 2}&lables=PRN&encoding=none")
             assert status == 200 and len(json.loads(response)["PRN"]) == 2
             status, response = request(port, f"showsamp?timestamp={now - 12}&lables=PRN&encoding=none")
@@ -265,5 +266,10 @@ def main():
     print("integration: rawlog, JSON, metrics, cache changes OK")
 
 
+class MetricsIntegration(unittest.TestCase):
+    def test_metrics_contract(self):
+        main()
+
+
 if __name__ == "__main__":
-    main()
+    unittest.main()

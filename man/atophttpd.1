@@ -13,7 +13,8 @@ login permission of a server, it's also possible to get/analyze
 statistics of many servers in batch.
 The /metrics endpoint exports process TCP and UDP receive/transmit bytes per
 second for Prometheus. Process metrics require atop process-network data
-from a compatible collector and atop started with \-K.
+from a compatible collector and atop started with \-K. /health returns HTTP 200
+when the latest sample is fresh and has process-network support, otherwise 503.
 
 Since atophttpd access the rawlog of atop, this daemon requires the
 permission of
@@ -47,8 +48,8 @@ greater of 30 seconds and twice the atop sample interval.
 \-a ADDR
 Bind HTTP to ADDR, default 127.0.0.1.
 .TP
-\-t PORT
-Enable mutual TLS on PORT. TLS support requires a build with USE_TLS=YES.
+\-t[PORT], \-\-tls-port[=PORT]
+Enable mutual TLS on PORT (default 2868). TLS support requires a build with USE_TLS=YES.
 .SH METRICS
 The /metrics endpoint returns interval gauges named
 .B atophttpd_process_network_receive_bytes_per_second
@@ -58,6 +59,9 @@ The labels are host, pid, name, start_time and protocol. Status gauges report
 sample timestamp, interval, age, freshness and process-network availability.
 If no complete sample is available, no process series are returned; a malformed
 indexed sample returns HTTP 503. Do not apply Prometheus rate() to these gauges.
+The /health endpoint checks freshness and availability without formatting
+process series. /showsamp accepts the original lables query parameter and
+labels as an alias.
 .SH SOURCE
 https://github.com/pizhenwei/atophttpd
 .SH OS

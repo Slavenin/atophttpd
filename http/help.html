@@ -10,7 +10,7 @@
 	<li>js/atop.js: get&nbsp;atop.js.</li>
 	<li>css/atop.css: get&nbsp;css/atop.css.</li>
 	<li>template: get&nbsp;template for atop&nbsp;rendering. Supported argument <strong>type</strong>(required, available options: generic/memory/disk/command_line).</li>
-	<li>showsamp: get atop sample data.&nbsp;Supported argument <strong>timestamp</strong>(required, UNIX timestamp to query),&nbsp;<strong>lables</strong> or <strong>labels</strong>(required, available options: ALL/CPU/cpu/CPL/GPU/MEM/SWP/PAG/PSI/LVM/MDD/DSK/NFM/NFC/NFS/NET/IFB/NUM/NUC/LLC/PRG/PRC/PRM/PRD/PRN/PRE. Select one label, e.g. lables=CPU; or multiple, e.g. lables=CPU,cpu,CPL),&nbsp;<strong>encoding</strong>(optional, deflate/none).</li>
-	<li>metrics: Prometheus interval gauges for per-process TCP/UDP receive and transmit bytes per second, with freshness and availability status. Process traffic requires atop started with -K and a compatible network collector.</li>
-	<li>health: return HTTP 200 with "ok" when the latest sample is fresh and records process-network data; otherwise return HTTP 503. This does not render the full Prometheus body.</li>
+	<li>showsamp: get atop sample data.&nbsp;Supported argument <strong>timestamp</strong>(required, UNIX timestamp to query),&nbsp;<strong>lables</strong> or <strong>labels</strong>(required, available options: ALL/CPU/cpu/CPL/GPU/MEM/SWP/ZSW/PAG/PSI/LVM/MDD/DSK/NFM/NFC/NFS/NET/IFB/NUM/NUC/LLC/PRG/PRC/PRM/PRD/PRN/PRE. Select one label, e.g. labels=CPU; or multiple, e.g. labels=CPU,cpu,CPL),&nbsp;<strong>encoding</strong>(optional, deflate/none).</li>
+	<li>metrics: Prometheus gauges for per-process TCP/UDP receive and transmit bytes per atop interval second, plus sample freshness and availability. Requires atop started with -K and a compatible network collector.</li>
+	<li>health: HTTP 200 with "ok" when the latest sample is fresh and records process-network data; HTTP 503 otherwise. Does not render the full metrics body.</li>
 </ul>

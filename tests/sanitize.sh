@@ -1,0 +1,100 @@
+#!/usr/bin/env bash
+#
+# Build atophttpd and its unit/integration tests with AddressSanitizer and
+# UndefinedBehaviorSanitizer, then run the whole suite. Any memory error
+# (overflow, use-after-free, leak) or undefined behaviour aborts the run with
+# a non-zero exit, so this doubles as a CI gate.
+#
+# Usage: tests/sanitize.sh
+#
+set -euo pipefail
+
+ATOP_VERSION="${ATOP_VERSION:-v2.13.0}"
+
+cd "$(dirname "$0")/.."
+ROOT="$(pwd)"
+
+CC="${CC:-gcc}"
+SAN="-fsanitize=address,undefined -fno-sanitize-recover=all -fno-omit-frame-pointer"
+CFLAGS="-Iatop -I. -g -O1 -Wall -std=gnu11 $SAN -pthread"
+LDLIBS="-lz -pthread"
+
+MODULES="cache httpd json metrics output rawlog connection socket tls http_args log"
+OBJS="cache.o httpd.o json.o metrics.o output.o rawlog.o version.o connection.o socket.o tls.o http_args.o log.o"
+
+echo ">> cleaning previous artefacts"
+make clean >/dev/null 2>&1 || true
+
+echo ">> ensuring submodule + generated headers"
+if [[ "${SKIP_SUBMODULE_UPDATE:-0}" == 1 ]]; then
+	make SKIP_SUBMODULE_UPDATE=1 ATOP_VERSION="$ATOP_VERSION" submodule
+else
+	git submodule update --init --recursive >/dev/null 2>&1 || true
+	git -C atop fetch --tags --quiet >/dev/null 2>&1 || true
+	git -C atop checkout --quiet "$ATOP_VERSION" >/dev/null 2>&1 || true
+fi
+make -C atop versdate.h >/dev/null 2>&1 || true
+
+echo ">> building atop (used to generate a raw-log for integration tests)"
+make -C atop atop >/dev/null 2>&1 || echo "   (warning: could not build atop; sample tests will be skipped)"
+
+RAWLOG_SAMPLE=""
+if [[ -x atop/atop ]]; then
+	SAMPLE_DIR="$(mktemp -d)"
+	if atop/atop -w "$SAMPLE_DIR/atop_sample" 1 3 >/dev/null 2>&1; then
+		RAWLOG_SAMPLE="$SAMPLE_DIR/atop_sample"
+	fi
+fi
+
+echo ">> compiling sanitized objects"
+for m in $MODULES; do
+	$CC -c $CFLAGS "$m.c" -o "$m.o"
+done
+$CC -c $CFLAGS atop/version.c -o version.o
+
+echo ">> linking sanitized atophttpd"
+# shellcheck disable=SC2086
+$CC $SAN -o atophttpd $OBJS $LDLIBS
+
+echo ">> building sanitized unit tests"
+$CC $CFLAGS tests/unit/test_cache.c      cache.o                                    -o tests/unit/test_cache      $LDLIBS
+$CC $CFLAGS tests/unit/test_output.c     output.o                                   -o tests/unit/test_output     $LDLIBS
+$CC $CFLAGS tests/unit/test_http_args.c  http_args.o                                -o tests/unit/test_http_args  $LDLIBS
+$CC $CFLAGS -Wl,--wrap=write,--wrap=writev tests/unit/test_connection.c connection.o socket.o tls.o log.o          -o tests/unit/test_connection $LDLIBS
+$CC $CFLAGS tests/unit/test_rawlog.c     rawlog.o cache.o json.o output.o log.o version.o -o tests/unit/test_rawlog $LDLIBS
+$CC $CFLAGS tests/unit/test_json.c       json.o output.o version.o                  -o tests/unit/test_json      $LDLIBS
+# test_httpd_write.c #includes httpd.c (.incbin paths run from here, the ROOT)
+$CC $CFLAGS tests/unit/test_httpd_write.c connection.o socket.o tls.o log.o \
+	http_args.o cache.o json.o metrics.o output.o rawlog.o version.o      \
+	-o tests/unit/test_httpd_write $LDLIBS
+$CC $CFLAGS tests/unit/test_metrics.c metrics.o -o tests/unit/test_metrics $LDLIBS
+$CC $CFLAGS tests/fixtures/mkmetrics.c version.o -o tests/fixtures/mkmetrics $LDLIBS
+# TLS backend test: #includes tls.c with -DUSE_TLS (so the real non-blocking
+# handshake/read/write code is sanitized, not the stub) and interposes on
+# SSL_accept/SSL_read/SSL_write/SSL_get_error.
+# Reuses the already-sanitized connection/socket/log objects.
+$CC $CFLAGS -DUSE_TLS -Wl,--wrap=SSL_accept,--wrap=SSL_read,--wrap=SSL_write,--wrap=SSL_get_error \
+	tests/unit/test_tls.c connection.o socket.o log.o -o tests/unit/test_tls $LDLIBS -lssl -lcrypto
+
+export UBSAN_OPTIONS="print_stacktrace=1:halt_on_error=1"
+
+echo ">> running sanitized unit tests (leak detection on)"
+export ASAN_OPTIONS="abort_on_error=1:detect_leaks=1"
+rc=0
+for t in test_cache test_output test_http_args test_connection test_rawlog test_json test_tls test_httpd_write test_metrics; do
+	echo "--- $t ---"
+	RAWLOG_SAMPLE="$RAWLOG_SAMPLE" "./tests/unit/$t" || rc=1
+done
+[[ "$rc" -eq 0 ]] || { echo "UNIT TESTS FAILED UNDER SANITIZERS"; exit 1; }
+
+echo ">> running sanitized integration tests"
+# The long-running server keeps a few process-lifetime allocations (output
+# buffer, caches) that are intentionally never freed; disable leak detection
+# for it so only real errors (overflows, UAF, UB) fail the run.
+ASAN_OPTIONS="abort_on_error=1:detect_leaks=0" \
+ATOPHTTPD_BIN="$ROOT/atophttpd" ATOP_BIN="$ROOT/atop/atop" \
+	python3 -m unittest -v tests.integration.test_integration tests.integration.test_metrics
+
+echo
+echo "================= SANITIZERS CLEAN ================="
+make clean >/dev/null 2>&1 || true
